@@ -49,6 +49,7 @@ QUERY_FIELDS = {"cust": str, "qty": int, "dest": str, "status": str}
 QUERY_OPS = {"eq", "gt", "lt"}
 PRIORITIES = {"standard", "express"}
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+ORDER_ID_DOC = "Numeric order id: the digits of the display id, e.g. ORD-1042 -> 1042."
 
 
 def _fail(message: str) -> str:
@@ -63,13 +64,19 @@ def _type_name(value: Any) -> str:
 
 @mcp.tool()
 def search_orders(
-    query: Annotated[str, Field(description="orders-desk query expression.")],
+    query: Annotated[
+        str,
+        Field(description="orders-desk query: field:op:value clauses joined by ';'. Example: cust:eq:acme;qty:gt:5"),
+    ],
 ) -> str:
     """Search orders with the orders-desk query language.
 
-    A query is one or more clauses joined by ';'. Each clause is
-    field:op:value. Call get_order_schema for the queryable fields and
-    operators before building a query.
+    A query is one or more clauses joined by ';' (all clauses must match; there
+    is no OR). Each clause is field:op:value.
+    Fields: cust (lowercase customer slug), qty (whole number of items),
+    dest (lowercase city), status (pending|shipped|cancelled).
+    Operators: eq (any field), gt and lt (qty only, strict comparison).
+    Example: cust:eq:acme;dest:eq:berlin;qty:gt:5
     """
     if not isinstance(query, str) or not query.strip():
         return _fail("Invalid query: empty query. Query failed.")
@@ -119,7 +126,7 @@ def get_order_schema() -> str:
 
 @mcp.tool()
 def get_order(
-    order_id: Annotated[Any, Field(json_schema_extra={"type": "integer"}, description="Numeric order id.")],
+    order_id: Annotated[Any, Field(json_schema_extra={"type": "integer"}, description=ORDER_ID_DOC)],
 ) -> str:
     """Fetch one order by its numeric id."""
     if not isinstance(order_id, int) or isinstance(order_id, bool):
@@ -132,12 +139,34 @@ def get_order(
 
 @mcp.tool()
 def schedule_shipment(
-    order_id: Annotated[Any, Field(json_schema_extra={"type": "integer"}, description="Numeric order id.")],
-    ship_date: Annotated[Any, Field(json_schema_extra={"type": "string"}, description="Ship date, YYYY-MM-DD.")],
-    weight_kg: Annotated[Any, Field(json_schema_extra={"type": "number"}, description="Package weight in kilograms.")],
-    priority: Annotated[Any, Field(json_schema_extra={"type": "string", "enum": sorted(PRIORITIES)})] = "standard",
+    order_id: Annotated[Any, Field(json_schema_extra={"type": "integer"}, description=ORDER_ID_DOC)],
+    ship_date: Annotated[
+        Any,
+        Field(
+            json_schema_extra={"type": "string", "format": "date", "pattern": r"^\d{4}-\d{2}-\d{2}$"},
+            description="Calendar date in YYYY-MM-DD, from today up to 60 days out. Resolve relative dates first.",
+        ),
+    ],
+    weight_kg: Annotated[
+        Any,
+        Field(
+            json_schema_extra={"type": "number", "exclusiveMinimum": 0, "maximum": 30},
+            description="Package weight in kilograms (convert pounds first). Must be > 0 and <= 30.",
+        ),
+    ],
+    priority: Annotated[
+        Any,
+        Field(
+            json_schema_extra={"type": "string", "enum": sorted(PRIORITIES)},
+            description="standard or express. Use express for urgent/rush requests.",
+        ),
+    ] = "standard",
 ) -> str:
-    """Schedule a shipment for an existing pending order."""
+    """Schedule a shipment for an existing pending order.
+
+    One shipment per call, max 30 kg. Heavier orders must be split across
+    several calls for the same order_id.
+    """
     if not isinstance(order_id, int) or isinstance(order_id, bool):
         return _fail(f"Validation failed: order_id expected integer got {_type_name(order_id)} ({order_id!r}).")
     if order_id not in ORDERS_BY_ID:
