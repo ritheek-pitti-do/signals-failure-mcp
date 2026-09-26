@@ -16,8 +16,9 @@ isError results.
 """
 
 import os
+import random
 import re
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from typing import Annotated, Any
 
 from mcp.server.fastmcp import FastMCP
@@ -135,6 +136,53 @@ def get_order(
     if order is None:
         return f"No order {order_id}."
     return str(order)
+
+
+HISTORY_LINES = int(os.environ.get("HISTORY_LINES", "220"))
+HISTORY_ACTORS = ["wms-bot", "j.ortega", "m.lindqvist", "a.kowalski", "s.okafor", "dock-scanner-3", "k.tanaka"]
+HISTORY_EVENTS = [
+    "picked {n} units from aisle {a}, bin {b}",
+    "moved tote T-{t} from zone {z} to packing station {s}",
+    "cycle count at aisle {a}: expected {n}, counted {n}",
+    "customer contact note added: delivery window confirmed for weekdays",
+    "label reprinted at station {s} (smudged barcode)",
+    "carton C-{t} sealed, dimensions {d}x{d}x{d} cm",
+    "stock reservation refreshed for {n} units",
+    "address line 2 normalized by address checker",
+    "quality check passed at station {s}",
+    "pallet slot {z}-{b} assigned for staging",
+    "packing slip regenerated with updated contact name",
+    "scan at dock door {s}, tote T-{t}",
+]
+
+
+@mcp.tool()
+def get_order_history(
+    order_id: Annotated[Any, Field(json_schema_extra={"type": "integer"}, description=ORDER_ID_DOC)],
+) -> str:
+    """Full warehouse audit trail for one order, oldest event first.
+
+    Long output: every pick, move, scan and note recorded for the order, plus
+    any open hold at the end.
+    """
+    if not isinstance(order_id, int) or isinstance(order_id, bool):
+        return _fail(f"Validation failed: order_id expected integer got {_type_name(order_id)} ({order_id!r}).")
+    order = ORDERS_BY_ID.get(order_id)
+    if order is None:
+        return f"No order {order_id}."
+    rng = random.Random(order_id)
+    start = datetime(2026, 9, 1, 6, 0)
+    lines = [f"Audit trail for order {order_id} ({order['cust']}, {order['qty']} items, {order['dest']}):"]
+    for i in range(HISTORY_LINES):
+        ts = start + timedelta(minutes=17 * i + rng.randint(0, 9))
+        event = rng.choice(HISTORY_EVENTS).format(
+            n=rng.randint(1, 40), a=rng.randint(1, 48), b=rng.randint(1, 120), t=rng.randint(1000, 9999),
+            z=rng.choice("ABCDEF"), s=rng.randint(1, 12), d=rng.randint(20, 80),
+        )
+        lines.append(f"{ts:%Y-%m-%d %H:%M} #{i + 1:03d} {rng.choice(HISTORY_ACTORS)}: {event}")
+    hold = {1043: "address verification pending", 1061: "customer asked to hold until the 1st"}.get(order_id, "none")
+    lines.append(f"Open hold: {hold}")
+    return "\n".join(lines)
 
 
 @mcp.tool()
