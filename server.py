@@ -7,14 +7,19 @@ the Signals execution-failure regexes:
                        (ExecutionFailureBadQuery)
 * schedule_shipment -> "validation failed" / "expected integer got string" /
                        "invalid date" (ExecutionFailureInvalidArgs)
+* release_hold      -> "precondition failed" / "must call open_hold first"
+                       (ExecutionFailureStateError)
 
 search_orders error text must avoid every InvalidArgs / ToolNotFound /
 AuthMisuse / StateError pattern, because the analyzer checks those first.
+release_hold's precondition text must avoid InvalidArgs, ToolNotFound, and
+AuthMisuse for the same reason: those are checked before StateError.
 
 Set ERRORS_AS_CONTENT=1 to return errors as normal tool output instead of
 isError results.
 """
 
+import hashlib
 import os
 import random
 import re
@@ -51,6 +56,24 @@ QUERY_OPS = {"eq", "gt", "lt"}
 PRIORITIES = {"standard", "express"}
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 ORDER_ID_DOC = "Numeric order id: the digits of the display id, e.g. ORD-1042 -> 1042."
+# Shared with get_order_history so the hold text stays the same in both tools.
+OPEN_HOLDS = {
+    1043: "address verification pending",
+    1061: "customer asked to hold until the 1st",
+}
+
+
+def _hold_ticket(order_id: int) -> str:
+    digest = hashlib.sha256(f"orders-desk-hold:{order_id}".encode()).hexdigest()[:8]
+    return f"HOLD-{order_id}-{digest}"
+
+
+def _require_order_id(order_id: Any) -> int | str:
+    if not isinstance(order_id, int) or isinstance(order_id, bool):
+        return _fail(f"Validation failed: order_id expected integer got {_type_name(order_id)} ({order_id!r}).")
+    if order_id not in ORDERS_BY_ID:
+        return f"No order {order_id}."
+    return order_id
 
 
 def _fail(message: str) -> str:
@@ -180,9 +203,54 @@ def get_order_history(
             z=rng.choice("ABCDEF"), s=rng.randint(1, 12), d=rng.randint(20, 80),
         )
         lines.append(f"{ts:%Y-%m-%d %H:%M} #{i + 1:03d} {rng.choice(HISTORY_ACTORS)}: {event}")
-    hold = {1043: "address verification pending", 1061: "customer asked to hold until the 1st"}.get(order_id, "none")
-    lines.append(f"Open hold: {hold}")
+    lines.append(f"Open hold: {OPEN_HOLDS.get(order_id, 'none')}")
     return "\n".join(lines)
+
+
+@mcp.tool()
+def open_hold(
+    order_id: Annotated[Any, Field(json_schema_extra={"type": "integer"}, description=ORDER_ID_DOC)],
+) -> str:
+    """Look up the open hold on one order and return the ticket release_hold requires.
+
+    Only an order with an open hold returns a ticket. Pass that exact ticket to
+    release_hold. Orders with no open hold do not return a ticket.
+    """
+    checked = _require_order_id(order_id)
+    if not isinstance(checked, int):
+        return checked
+    reason = OPEN_HOLDS.get(checked)
+    if reason is None:
+        return f"No open hold on order {checked}."
+    return f"Open hold on order {checked}: {reason}. ticket={_hold_ticket(checked)}"
+
+
+@mcp.tool()
+def release_hold(
+    order_id: Annotated[Any, Field(json_schema_extra={"type": "integer"}, description=ORDER_ID_DOC)],
+    ticket: Annotated[
+        Any,
+        Field(
+            default="",
+            description=(
+                "Ticket returned by open_hold for this order. Call open_hold first and pass "
+                "that exact ticket. Do not invent a ticket."
+            ),
+        ),
+    ] = "",
+) -> str:
+    """Release the open hold on one order.
+
+    Call open_hold first and pass the ticket it returns. Do not invent a ticket.
+    A missing or invented ticket is a precondition failure.
+    """
+    checked = _require_order_id(order_id)
+    if not isinstance(checked, int):
+        return checked
+    expected = _hold_ticket(checked) if checked in OPEN_HOLDS else None
+    if not isinstance(ticket, str) or ticket != expected:
+        return _fail("Precondition failed: must call open_hold first.")
+    return f"Hold released: order {checked} ({OPEN_HOLDS[checked]})."
 
 
 @mcp.tool()
